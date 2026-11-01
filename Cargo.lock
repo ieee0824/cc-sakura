@@ -175,6 +175,7 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "futures-util",
  "reqwest",
  "rusqlite",
  "serde",

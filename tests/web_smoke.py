@@ -105,6 +105,17 @@ print(json.dumps({'status':'uncertain','text':'テスト成功と推測します
         newer = api('send', {'room':'test-room','payload':'new post'},session)
         status, _, body = request(url + 'api/history?after=127')
         assert json.loads(body)['messages'][0]['id'] == newer['id']
+        # Browser stream is a same-origin proxy: no central token is exposed.
+        with urllib.request.urlopen(url + 'api/events?after=127', timeout=10) as stream:
+            assert stream.headers['Content-Type'].startswith('text/event-stream')
+            while True:
+                line = stream.readline()
+                if line.startswith(b'data:'):
+                    batch = json.loads(line[5:])
+                    assert batch['messages'][0]['id'] == newer['id']
+                    assert session.encode() not in line
+                    break
+        assert request(url + 'api/events?after=127', headers={'Origin':'https://attacker.example'})[0] == 403
         assert request(url + 'api/history?after=1&before=5')[0] == 400
         assert request(origin + '/api/history')[0] == 404
         assert request(url + 'api/history', headers={'Host':'attacker.example'})[0] == 403

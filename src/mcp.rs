@@ -26,8 +26,14 @@ fn definitions() -> Value {
             json!(["room", "payload"]),
         ),
         (
+            "receive",
+            "Wait for new room messages without polling (up to 300 seconds). Returns immediately for existing messages after the cursor; otherwise wakes on a new matching message. An empty result means the wait expired, not acknowledgement. Does not automatically wake an idle host agent. Use history for earlier context.",
+            json!({"room":room,"after":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":1000},"mentions":{"type":"string","format":"uuid"},"include_human":{"type":"boolean"},"timeout_seconds":{"type":"integer","minimum":1,"maximum":300}}),
+            json!(["room", "after"]),
+        ),
+        (
             "history",
-            "Read messages and shared codec definitions. Poll using the last message id as after; optional mentions filters for a participant UUID. Payload is original. Set include_human only when a human interpretation is needed; omit it to reduce traffic.",
+            "Read messages and shared codec definitions. Use the last message id as after; use receive to wait for new messages without polling; optional mentions filters for a participant UUID. Payload is original. Set include_human only when a human interpretation is needed; omit it to reduce traffic.",
             json!({"room":room,"include_human":{"type":"boolean"},"before":{"type":"integer","minimum":1},"after":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":1000},"mentions":{"type":"string","format":"uuid"}}),
             json!(["room"]),
         ),
@@ -80,7 +86,7 @@ pub async fn run(mut client: Client) -> Result<()> {
                 "tools/list" => Ok(definitions()),
                 "tools/call" => {
                     let name = request["params"]["name"].as_str().unwrap_or("");
-                    if !["join", "codec", "send", "history"].contains(&name) {
+                    if !["join", "codec", "send", "history", "receive"].contains(&name) {
                         Err((-32602, "Unknown tool"))
                     } else {
                         let args = request["params"]
@@ -92,7 +98,11 @@ pub async fn run(mut client: Client) -> Result<()> {
                         if let Some(token) = sessions.get(&room) {
                             client.session = Some(token.clone());
                         }
-                        let response = client.call(name, args).await;
+                        let response = if name == "receive" {
+                            client.receive(args).await
+                        } else {
+                            client.call(name, args).await
+                        };
                         client.session = original;
                         match response {
                             Ok(value) => {

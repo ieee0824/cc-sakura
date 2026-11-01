@@ -1,9 +1,10 @@
 use anyhow::{Context, Result, bail};
 use axum::{
     Json, Router,
-    extract::{ConnectInfo, Path, State},
+    extract::{ConnectInfo, Path, Query, State},
     http::{HeaderMap, StatusCode},
-    routing::post,
+    response::sse::{Event, KeepAlive, Sse},
+    routing::{get, post},
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
@@ -15,6 +16,118 @@ use std::{
 use uuid::Uuid;
 
 type Db = Arc<Mutex<Connection>>;
+#[derive(Clone)]
+struct Server {
+    db: Db,
+    changed: tokio::sync::watch::Sender<u64>,
+}
+#[derive(serde::Deserialize)]
+struct Subscription {
+    room: String,
+    #[serde(default)]
+    after: i64,
+    mentions: Option<String>,
+    limit: Option<u32>,
+    #[serde(default)]
+    include_human: bool,
+}
+async fn query(
+    state: &Server,
+    operation: String,
+    args: Value,
+    credential: Option<String>,
+    ip: String,
+) -> Result<Value> {
+    let db = state.db.clone();
+    let value = tokio::task::spawn_blocking(move || {
+        let mut db = db
+            .lock()
+            .map_err(|_| anyhow::anyhow!("database unavailable"))?;
+        execute(&mut db, &operation, args, credential.as_deref(), &ip)
+    })
+    .await??;
+    Ok(value)
+}
+fn bearer(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("authorization")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .map(str::to_owned)
+}
+async fn events(
+    State(state): State<Server>,
+    Query(cursor): Query<Subscription>,
+    headers: HeaderMap,
+) -> Result<impl axum::response::IntoResponse, (StatusCode, Json<Value>)> {
+    // Subscribe before the initial snapshot so a concurrent commit cannot be missed.
+    let changed = state.changed.subscribe();
+    let mut args = json!({"room":cursor.room,"after":cursor.after,"mentions":cursor.mentions,"include_human":cursor.include_human,"limit":cursor.limit.unwrap_or(100)});
+    if let Some(id) = headers
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<i64>().ok())
+    {
+        args["after"] = json!(id.max(cursor.after));
+    }
+    let credential = bearer(&headers);
+    let first = query(
+        &state,
+        "history".into(),
+        args.clone(),
+        credential.clone(),
+        String::new(),
+    )
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":e.to_string()})),
+        )
+    })?;
+    let stream = futures_util::stream::unfold(
+        (state, changed, args, credential, Some(first)),
+        |(state, mut changed, mut args, credential, mut ready)| async move {
+            loop {
+                let result = match ready.take() {
+                    Some(value) => Ok(value),
+                    None => {
+                        query(
+                            &state,
+                            "history".into(),
+                            args.clone(),
+                            credential.clone(),
+                            String::new(),
+                        )
+                        .await
+                    }
+                };
+                let value = match result {
+                    Ok(value) => value,
+                    Err(_) => return None,
+                };
+                let messages = value["messages"].as_array()?;
+                if let Some(last) = messages.last() {
+                    let id = last["id"].as_i64()?;
+                    args["after"] = json!(id);
+                    let event = Event::default()
+                        .event("messages")
+                        .id(id.to_string())
+                        .data(value.to_string());
+                    return Some((
+                        Ok::<_, std::convert::Infallible>(event),
+                        (state, changed, args, credential, None),
+                    ));
+                }
+                if changed.changed().await.is_err() {
+                    return None;
+                }
+            }
+        },
+    );
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
 fn database(path: PathBuf) -> Result<Connection> {
     let db = Connection::open(path)?;
     db.busy_timeout(std::time::Duration::from_secs(5))?;
@@ -28,9 +141,12 @@ fn database(path: PathBuf) -> Result<Connection> {
 }
 pub async fn serve(bind: SocketAddr, path: PathBuf) -> Result<()> {
     let db = Arc::new(Mutex::new(database(path)?));
+    let (changed, _) = tokio::sync::watch::channel(0);
+    let state = Server { db, changed };
     let app = Router::new()
+        .route("/api/events", get(events))
         .route("/api/{operation}", post(api))
-        .with_state(db);
+        .with_state(state);
     let listener = tokio::net::TcpListener::bind(bind).await?;
     eprintln!("sakura listening on {}", listener.local_addr()?);
     axum::serve(
@@ -41,39 +157,82 @@ pub async fn serve(bind: SocketAddr, path: PathBuf) -> Result<()> {
     Ok(())
 }
 async fn api(
-    State(db): State<Db>,
+    State(state): State<Server>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(operation): Path<String>,
     headers: HeaderMap,
     Json(args): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
-    let token = headers
-        .get("authorization")
-        .and_then(|h| h.to_str().ok())
-        .and_then(|h| h.strip_prefix("Bearer "))
-        .map(str::to_owned);
-    let result = tokio::task::spawn_blocking(move || {
-        let mut db = db
-            .lock()
-            .map_err(|_| anyhow::anyhow!("database unavailable"))?;
-        execute(
-            &mut db,
-            &operation,
+    let credential = bearer(&headers);
+    let mut changed = state.changed.subscribe();
+    let result = if operation == "receive" {
+        let seconds = args["timeout_seconds"].as_u64().unwrap_or(300).min(300);
+        if args["after"].as_i64().is_none_or(|id| id < 0) {
+            Err(anyhow::anyhow!(
+                "receive requires a nonnegative after cursor"
+            ))
+        } else if args.get("timeout_seconds").is_some_and(|v| {
+            v.as_u64()
+                .is_none_or(|seconds| !(1..=300).contains(&seconds))
+        }) {
+            Err(anyhow::anyhow!("timeout_seconds must be 1..300"))
+        } else if args.get("before").is_some() {
+            Err(anyhow::anyhow!("receive does not support before"))
+        } else {
+            let wait = async {
+                loop {
+                    let value = query(
+                        &state,
+                        "history".into(),
+                        args.clone(),
+                        credential.clone(),
+                        peer.ip().to_string(),
+                    )
+                    .await?;
+                    if value["messages"]
+                        .as_array()
+                        .is_some_and(|ms| !ms.is_empty())
+                    {
+                        return Ok(value);
+                    }
+                    changed.changed().await?;
+                }
+            };
+            match tokio::time::timeout(std::time::Duration::from_secs(seconds), wait).await {
+                Ok(result) => result,
+                Err(_) => {
+                    query(
+                        &state,
+                        "history".into(),
+                        args.clone(),
+                        credential,
+                        peer.ip().to_string(),
+                    )
+                    .await
+                }
+            }
+        }
+    } else {
+        let result = query(
+            &state,
+            operation.clone(),
             args,
-            token.as_deref(),
-            &peer.ip().to_string(),
+            credential,
+            peer.ip().to_string(),
         )
-    })
-    .await;
+        .await;
+        if result.is_ok() && operation == "send" {
+            state
+                .changed
+                .send_modify(|version| *version = version.wrapping_add(1));
+        }
+        result
+    };
     match result {
-        Ok(Ok(value)) => (StatusCode::OK, Json(value)),
-        Ok(Err(e)) => (
+        Ok(value) => (StatusCode::OK, Json(value)),
+        Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(json!({"error":e.to_string()})),
-        ),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error":"internal server error"})),
         ),
     }
 }

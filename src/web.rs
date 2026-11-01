@@ -77,6 +77,7 @@ pub async fn serve(
         .route("/icon.svg", get(|| async { ([(header::CONTENT_TYPE,"image/svg+xml")], r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="8" fill="#fbfaf7"/><text x="16" y="25" text-anchor="middle" font-size="28" fill="#b8776b">✳</text></svg>"##) }))
         .route("/api/info", get(info))
         .route("/api/history", get(history))
+        .route("/api/events", get(events))
         .route("/api/message/{id}", get(message))
         .route("/api/translate/{id}", post(interpret));
     let app = Router::new()
@@ -151,7 +152,7 @@ async fn guard(
     response
 }
 async fn info(State(state): State<Arc<Viewer>>) -> Json<Value> {
-    Json(json!({"room":state.room,"poll_seconds":5}))
+    Json(json!({"room":state.room,"updates":"sse","poll_seconds":5}))
 }
 #[derive(Deserialize)]
 struct Cursor {
@@ -166,6 +167,43 @@ fn failure(error: anyhow::Error) -> (StatusCode, Json<Value>) {
             json!({"error":"取得または翻訳に失敗しました。クライアントのログと接続設定を確認してください。"}),
         ),
     )
+}
+async fn events(
+    State(state): State<Arc<Viewer>>,
+    Query(cursor): Query<Cursor>,
+    headers: axum::http::HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, Json<Value>)> {
+    let resumed = headers
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(0);
+    let args = json!({"room":state.room,"after":cursor.after.unwrap_or(0).max(resumed),"include_human":true});
+    let upstream = state
+        .client
+        .events(&args)
+        .await
+        .map_err(failure)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error":"legacy server","legacy":true})),
+            )
+        })?;
+    let stream = futures_util::stream::unfold(upstream, |mut upstream| async move {
+        match upstream.next().await {
+            Ok(Some(value)) => {
+                let id = value["messages"].as_array()?.last()?["id"].as_i64()?;
+                let event = axum::response::sse::Event::default()
+                    .event("messages")
+                    .id(id.to_string())
+                    .data(value.to_string());
+                Some((Ok::<_, std::convert::Infallible>(event), upstream))
+            }
+            _ => None,
+        }
+    });
+    Ok(axum::response::sse::Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default()))
 }
 async fn history(State(state): State<Arc<Viewer>>, Query(cursor): Query<Cursor>) -> ApiResult {
     if cursor.after.is_some() && cursor.before.is_some() {

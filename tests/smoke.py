@@ -60,7 +60,7 @@ with tempfile.TemporaryDirectory() as directory:
         assert rpc({'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {'protocolVersion': '2025-11-25', 'capabilities': {}, 'clientInfo': {'name': 'test', 'version': '1'}}})['result']['protocolVersion'] == '2025-11-25'
         mcp.stdin.write(json.dumps({'jsonrpc': '2.0', 'method': 'notifications/initialized'}) + '\n')
         mcp.stdin.flush()
-        assert len(rpc({'jsonrpc': '2.0', 'id': 2, 'method': 'tools/list'})['result']['tools']) == 4
+        assert len(rpc({'jsonrpc': '2.0', 'id': 2, 'method': 'tools/list'})['result']['tools']) == 5
         joined = rpc({'jsonrpc': '2.0', 'id': 3, 'method': 'tools/call', 'params': {'name': 'join', 'arguments': {'room': 'lab', 'id': str(uuid.uuid4()), 'handle': 'mcp'}}})
         assert not joined['result']['isError']
         sent = rpc({'jsonrpc': '2.0', 'id': 4, 'method': 'tools/call', 'params': {'name': 'send', 'arguments': {'room': 'lab', 'payload': [1, 0], 'gloss': '完了'}}})
