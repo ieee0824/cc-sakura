@@ -48,3 +48,24 @@ test('deep histories are processed iteratively, and an empty filter stays empty'
   assert.equal(p.visible.size,10000);
   assert.equal(build(messages,[]).roots.length,0);
 });
+
+test('large conversations only enumerate the requested reply page',()=>{
+  const {replies}=require('../src/web/threads.js');
+  const messages=[post(1),...Array.from({length:10000},(_,i)=>post(i+2,1))];
+  const p=build(messages);
+  const first=replies(p,1,20);
+  const more=replies(p,1,40);
+  assert.equal(first.length,20);
+  assert.equal(more.length,40);
+  assert.deepEqual(first.map(m=>m.id),Array.from({length:20},(_,i)=>i+2));
+  assert.equal(p.counts.get(1),10000); // Counts never require rendering the replies.
+  assert.equal(p.rootFor.get(10001),1);
+});
+test('reply pagination retains traversal and depth without walking the complete chain',()=>{
+  const {replies}=require('../src/web/threads.js');
+  const messages=Array.from({length:10000},(_,i)=>post(i+1,i||undefined));
+  const p=build(messages);
+  assert.deepEqual(replies(p,1,3),[{id:2,depth:1},{id:3,depth:2},{id:4,depth:3}]);
+  assert.equal(p.rootFor.get(10000),1);
+  assert.equal(replies(p,1,0).length,0);
+});
