@@ -1,6 +1,7 @@
 mod mcp;
 mod server;
 mod translate;
+mod web;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -73,6 +74,16 @@ enum Command {
         #[arg(long)]
         follow: bool,
     },
+    /// Open a local, browser-based room timeline (read-only)
+    Web {
+        room: String,
+        #[arg(long, default_value_t = 8740)]
+        port: u16,
+        #[arg(long, value_enum)]
+        translator: Option<translate::Provider>,
+        #[arg(long)]
+        language: Option<String>,
+    },
     Mcp,
 }
 #[derive(Default, Deserialize, Serialize)]
@@ -134,6 +145,21 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Serve { bind, db } => server::serve(bind, db).await?,
         Command::Mcp => mcp::run(client).await?,
+        Command::Web {
+            room,
+            port,
+            translator,
+            language,
+        } => {
+            let mut settings = config.translation;
+            if let Some(provider) = translator {
+                settings.provider = provider;
+            }
+            if let Some(language) = language {
+                settings.language = Some(language);
+            }
+            web::serve(client, room, port, settings).await?;
+        }
         Command::Join { room, handle, id } => {
             let result = client
                 .call(
