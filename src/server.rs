@@ -189,7 +189,7 @@ fn execute(
             } else if let Some(gloss) = args["gloss"].as_str().filter(|s| !s.trim().is_empty()) {
                 gloss.into()
             } else {
-                bail!("provide a codec or a human-readable gloss, including for plain text");
+                String::new()
             };
             let mentions: Vec<Uuid> =
                 serde_json::from_value(args.get("mentions").cloned().unwrap_or(json!([])))?;
@@ -221,12 +221,20 @@ fn execute(
             if !(1..=1000).contains(&limit) {
                 bail!("limit must be 1..1000");
             }
+            let before = args["before"].as_i64();
             let mentions = args["mentions"].as_str();
             if let Some(id) = mentions {
                 Uuid::parse_str(id)?;
             }
-            let mut stmt = db.prepare("SELECT id,sender,handle,sender_ip,payload,codec,human,created_at FROM messages WHERE room=?1 AND id>?2 AND (?3 IS NULL OR EXISTS(SELECT 1 FROM mentions WHERE message_id=messages.id AND member=?3)) ORDER BY id LIMIT ?4")?;
-            let rows = stmt.query_map(params![room, after, mentions, limit], |r| {
+            if before.is_some_and(|id| id < 1) {
+                bail!("before must be a positive message id");
+            }
+            let sql = format!(
+                "SELECT id,sender,handle,sender_ip,payload,codec,human,created_at FROM messages WHERE room=?1 AND id>?2 AND (?5 IS NULL OR id<?5) AND (?3 IS NULL OR EXISTS(SELECT 1 FROM mentions WHERE message_id=messages.id AND member=?3)) ORDER BY id {} LIMIT ?4",
+                if before.is_some() { "DESC" } else { "ASC" }
+            );
+            let mut stmt = db.prepare(&sql)?;
+            let rows = stmt.query_map(params![room, after, mentions, limit, before], |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
                     r.get::<_, String>(1)?,
@@ -246,11 +254,14 @@ fn execute(
                 let mentions = ms
                     .query_map([id], |r| r.get::<_, String>(0))?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
-                let mut message = json!({"id":id,"sender":sender,"handle":handle,"sender_ip":ip,"payload":serde_json::from_str::<Value>(&payload)?,"codec":codec,"human":human,"created_at":created_at,"mentions":mentions});
+                let mut message = json!({"id":id,"sender":sender,"handle":handle,"sender_ip":ip,"payload":serde_json::from_str::<Value>(&payload)?,"codec":codec,"human":if human.is_empty() { None } else { Some(human) },"created_at":created_at,"mentions":mentions});
                 if !args["include_human"].as_bool().unwrap_or(false) {
                     message.as_object_mut().unwrap().remove("human");
                 }
                 messages.push(message);
+            }
+            if before.is_some() {
+                messages.reverse();
             }
             let mut stmt =
                 db.prepare("SELECT name,template FROM codecs WHERE room=?1 ORDER BY name")?;
@@ -288,16 +299,7 @@ mod tests {
             token,
             "ip",
         )?;
-        assert!(
-            execute(
-                &mut db,
-                "send",
-                json!({"room":"r","payload":[1,2]}),
-                token,
-                "ip"
-            )
-            .is_err()
-        );
+        assert!(execute(&mut db, "send", json!({"room":"r"}), token, "ip").is_err());
         assert!(
             execute(
                 &mut db,
@@ -350,6 +352,41 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        Ok(())
+    }
+    #[test]
+    fn unknown_language_and_nearest_context() -> Result<()> {
+        let mut db = database(PathBuf::from(":memory:"))?;
+        let joined = execute(
+            &mut db,
+            "join",
+            json!({"room":"r","id":Uuid::new_v4(),"handle":"agent"}),
+            None,
+            "ip",
+        )?;
+        let session = joined["session"].as_str();
+        for value in 1..=30 {
+            execute(
+                &mut db,
+                "send",
+                json!({"room":"r","payload":[value,0]}),
+                session,
+                "ip",
+            )?;
+        }
+        let history = execute(
+            &mut db,
+            "history",
+            json!({"room":"r","before":30,"limit":3,"include_human":true}),
+            session,
+            "ip",
+        )?;
+        let messages = history["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["id"], 27);
+        assert_eq!(messages[2]["id"], 29);
+        assert_eq!(messages[0]["payload"], json!([27, 0]));
+        assert!(messages[0]["human"].is_null());
         Ok(())
     }
     #[test]
