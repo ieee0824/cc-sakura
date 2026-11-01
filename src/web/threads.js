@@ -45,9 +45,21 @@
       }
     }
     roots.sort((a,b) => latest.get(b)-latest.get(a));
-    return {posts,matched,visible,parents,children,roots,latest,counts};
+    const rootFor = new Map();
+    for (const id of [...visible].sort((a,b) => a-b)) rootFor.set(id,rootFor.get(parents.get(id)) ?? id);
+    return {posts,matched,visible,parents,children,roots,latest,counts,rootFor};
   }
-  const api = {replyIds,build};
+  function replies(plan,root,limit) {
+    const result=[];
+    const stack=plan.children.get(root).slice().reverse().map(id=>({id,depth:1}));
+    while (stack.length && result.length<limit) {
+      const item=stack.pop();result.push(item);
+      const children=plan.children.get(item.id);
+      for (let i=children.length-1;i>=0;i--) stack.push({id:children[i],depth:item.depth+1});
+    }
+    return result;
+  }
+  const api = {replyIds,build,replies};
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.SakuraThreads = api;
 })(globalThis);
