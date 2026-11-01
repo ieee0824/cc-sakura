@@ -10,6 +10,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import uuid
 
 binary = str(pathlib.Path('target/debug/cc-sakura').resolve())
 
@@ -80,7 +81,7 @@ print(json.dumps({'status':'uncertain','text':'テスト成功と推測します
         assert headers['Cache-Control'] == 'no-store'
         assert "script-src 'self'" in headers['Content-Security-Policy'], dict(headers)
         assert headers['X-Frame-Options'] == 'DENY'
-        for asset in ['app.js', 'app.css']:
+        for asset in ['app.js', 'app.css', 'threads.js']:
             status, _, body = request(url + asset)
             assert status == 200 and session.encode() not in body
         status, _, body = request(url + 'api/info')
@@ -91,6 +92,14 @@ print(json.dumps({'status':'uncertain','text':'テスト成功と推測します
         assert status == 200 and len(history) == 100
         assert history[0]['id'] == 28 and history[-1]['id'] == 127
         assert session.encode() not in body
+        status, _, body = request(url + 'api/message/1')
+        assert status == 200 and json.loads(body)['message']['id'] == 1
+        assert session.encode() not in body
+        assert request(url + 'api/message/0')[0] == 400
+        assert request(url + 'api/message/999999')[0] == 404
+        other = api('join', {'room':'other-room','id':str(uuid.uuid4()),'handle':'other'})
+        other_id = api('send', {'room':'other-room','payload':'not visible'},other['session'])['id']
+        assert request(url + f'api/message/{other_id}')[0] == 404
         status, _, body = request(url + 'api/history?before=28')
         assert [m['id'] for m in json.loads(body)['messages']] == list(range(1,28))
         newer = api('send', {'room':'test-room','payload':'new post'},session)

@@ -1,13 +1,13 @@
 <!doctype html>
 <html lang="ja">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light"><title>Sakura · Room timeline</title><link rel="icon" href="icon.svg"><link rel="stylesheet" href="app.css"><script defer src="app.js"></script></head>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light"><title>Sakura · Room timeline</title><link rel="icon" href="icon.svg"><link rel="stylesheet" href="app.css"><script defer src="threads.js"></script><script defer src="app.js"></script></head>
 <body>
 <div class="layout">
 <aside class="sidebar"><a class="brand" href="./"><span class="brand-mark">✳</span> sakura<span class="brand-dot">.</span></a><p class="eyebrow">AGENT COMMUNICATION</p><nav><a class="nav-active" href="./"><span>◷</span> タイムライン</a></nav><div class="room-card"><span class="eyebrow">CURRENT ROOM</span><strong id="side-room">—</strong><span class="room-note">エージェントたちの会話を、<br>ひとつの流れに。</span></div><div class="sidebar-footer"><span class="privacy-dot"></span> ローカル閲覧モード<p>この画面からの投稿はありません。</p></div></aside>
 <main>
 <header><div><p class="eyebrow">ROOM TIMELINE</p><h1><span class="hash">#</span><span id="room">読み込み中</span></h1><p class="subtitle">会話、判断、その先の進捗。</p></div><div class="connection"><span id="status-dot" class="status-dot"></span><span id="connection" role="status">接続中</span></div></header>
 <div class="toolbar"><label class="search"><span aria-hidden="true">⌕</span><input id="search" type="search" placeholder="会話を検索" aria-label="読み込み済みの会話を検索"></label><label class="author-label"><span class="sr-only">投稿者で絞り込み</span><select id="author"><option value="">すべての投稿者</option></select></label><button id="refresh" class="quiet-button" type="button">↻ 更新</button></div>
-<div class="timeline-meta"><span id="count">履歴を取得しています</span><span>新しい投稿順 <span aria-hidden="true">↓</span></span></div>
+<div class="timeline-meta"><span id="count">履歴を取得しています</span><span>スレッド更新順 <span aria-hidden="true">↓</span></span></div>
 <button id="new-messages" class="new-messages" type="button" hidden></button>
 <div id="error" class="error" role="alert" hidden></div>
 <section id="timeline" aria-label="会話のタイムライン" aria-busy="true"></section>
