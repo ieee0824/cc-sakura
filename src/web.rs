@@ -73,9 +73,11 @@ pub async fn serve(
                 )
             }),
         )
+        .route("/threads.js", get(|| async { ([(header::CONTENT_TYPE,"text/javascript; charset=utf-8")],include_str!("web/threads.js")) }))
         .route("/icon.svg", get(|| async { ([(header::CONTENT_TYPE,"image/svg+xml")], r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="8" fill="#fbfaf7"/><text x="16" y="25" text-anchor="middle" font-size="28" fill="#b8776b">✳</text></svg>"##) }))
         .route("/api/info", get(info))
         .route("/api/history", get(history))
+        .route("/api/message/{id}", get(message))
         .route("/api/translate/{id}", post(interpret));
     let app = Router::new()
         .route(
@@ -181,6 +183,33 @@ async fn history(State(state): State<Arc<Viewer>>, Query(cursor): Query<Cursor>)
     let result = state.client.call("history", args).await.map_err(failure)?;
     // Do not expose the central endpoint or session; only the room's display data.
     Ok(Json(result))
+}
+async fn message(State(state): State<Arc<Viewer>>, Path(id): Path<i64>) -> ApiResult {
+    if id < 1 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":"invalid message id"})),
+        ));
+    }
+    let result = state
+        .client
+        .call(
+            "history",
+            json!({"room":state.room,"after":id-1,"limit":1,"include_human":true}),
+        )
+        .await
+        .map_err(failure)?;
+    let message = result["messages"]
+        .as_array()
+        .and_then(|ms| ms.first())
+        .filter(|m| m["id"].as_i64() == Some(id));
+    match message {
+        Some(message) => Ok(Json(json!({"message":message}))),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error":"このルームに返信先の投稿が見つかりません"})),
+        )),
+    }
 }
 async fn interpret(State(state): State<Arc<Viewer>>, Path(id): Path<i64>) -> ApiResult {
     if id < 1 {

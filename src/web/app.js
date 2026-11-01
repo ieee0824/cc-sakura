@@ -4,6 +4,9 @@ const posts = new Map();
 const translations = new Map();
 const translating = new Set();
 const translationErrors = new Map();
+const collapsedThreads = new Set();
+const unreadReplies = new Set();
+const {replyIds,build:buildThreads} = SakuraThreads;
 let newest = 0, oldest = null, pending = 0, busy = false, more = true;
 const labels = {message:'メッセージ',scope:'担当範囲',status:'状況',request:'依頼',proposal:'提案',evidence:'根拠',results:'検証結果',tests:'テスト',test:'テスト',next:'次の作業',finding:'発見',review:'レビュー',recommendation:'推奨',coordination:'担当調整',change:'変更内容',observed:'観測結果',conclusion:'結論',action:'実施内容',local:'ローカル検証',ci:'CI',reply_to:'返信先',refs:'参照',open_question:'未解決の論点'};
 const types = {assignment_claim:'担当宣言',claim:'担当宣言',assignment_request:'担当依頼',verification_update:'検証報告',verification_and_scope_update:'検証・担当更新',design_review:'設計レビュー',design_review_request:'レビュー依頼',coordination:'担当調整',coordination_notice:'周知',discussion_topic:'議題',fix_pushed:'修正をpush',ci_observation:'CIの観測',issue_created:'Issue作成',investigation_request:'調査依頼',scope_notice:'変更範囲の共有',overlap_check:'競合確認'};
@@ -18,12 +21,13 @@ async function api(path, options = {}) {
 }
 function connection(ok) { $('connection').textContent = ok ? '自動更新中' : '再接続待ち'; $('status-dot').classList.toggle('offline',!ok); }
 function error(message) { $('error').textContent = message || ''; $('error').hidden = !message; }
-function ingest(messages) {
+function ingest(messages, markNew=false, paged=true) {
   let added = 0;
   for (const m of messages) {
     if (!Number.isSafeInteger(m.id) || m.id < 1) continue;
-    if (!posts.has(m.id)) added++;
-    posts.set(m.id,m); newest = Math.max(newest,m.id); oldest = oldest === null ? m.id : Math.min(oldest,m.id);
+    if (!posts.has(m.id)) {added++; if (markNew && replyIds(m).length) unreadReplies.add(m.id);}
+    posts.set(m.id,m); newest = Math.max(newest,m.id);
+    if (paged) oldest = oldest === null ? m.id : Math.min(oldest,m.id);
   }
   return added;
 }
@@ -36,7 +40,11 @@ function fieldValue(container, value) {
 function participantName(id) { for (const m of posts.values()) if (m.sender===id) return m.handle; return id; }
 function replyLink(id) {
   const link = node('a',`↪ #${id}`,'reply-link'); link.href=`#post-${id}`;
-  link.addEventListener('click',event=>{if (!$(`post-${id}`)) {event.preventDefault(); error('参照先が未表示です。絞り込みを解除するか、過去の投稿を読み込んでください。');}});
+  link.addEventListener('click',event=>{
+    const target=$(`post-${id}`);
+    if (!target) {event.preventDefault();error('参照先が未表示です。絞り込みを解除するか、過去の投稿を読み込んでください。');return;}
+    for (let parent=target.parentElement;parent;parent=parent.parentElement) if (parent.matches('details.thread-replies')) {parent.open=true;const root=parent.closest('.thread').querySelector('.post').id;collapsedThreads.delete(Number(root.replace('post-','')));}
+  });
   return link;
 }
 function showInterpretation(box,result) {
@@ -70,8 +78,7 @@ function card(m) {
     if (typeof payload.type==='string') tags.append(node('span',types[payload.type] || payload.type,'tag'));
     if (payload.issue!==undefined && ['string','number'].includes(typeof payload.issue)) tags.append(referenceTag('Issue',payload.issue));
     if (payload.pr!==undefined && ['string','number'].includes(typeof payload.pr)) tags.append(referenceTag('PR',payload.pr));
-    const replies=Array.isArray(payload.reply_to)?payload.reply_to:[payload.reply_to];
-    for (const id of replies) if (Number.isSafeInteger(id)&&id>0) tags.append(replyLink(id));
+    for (const id of replyIds(m)) tags.append(replyLink(id));
   }
   const body=fragment.querySelector('.post-body');
   if (m.human) body.append(node('p',m.human));
@@ -97,14 +104,64 @@ function card(m) {
   });
   return fragment;
 }
+function appendPost(container,id,plan) {
+  const fragment=card(plan.posts.get(id));
+  if (!plan.matched.has(id)) {
+    fragment.querySelector('.post-tags').append(node('span','会話の文脈','tag context-tag'));
+    fragment.querySelector('article').classList.add('context-post');
+  }
+  container.append(fragment);
+}
+function threadView(root,plan) {
+  const section=node('section',undefined,'thread'); section.setAttribute('aria-label',`投稿 #${root} のスレッド`);
+  appendPost(section,root,plan);
+  const parent=replyIds(plan.posts.get(root))[0];
+  if (parent && !plan.posts.has(parent)) {
+    const notice=node('div',undefined,'missing-parent');
+    notice.append(node('span',`返信先 #${parent} が未取得のため、単独で表示しています。`));
+    const load=node('button','返信先を読み込む','quiet-button');load.type='button';
+    load.addEventListener('click',async()=>{
+      load.disabled=true;
+      try {const result=await api(`message/${parent}`);ingest([result.message],false,false);render();error('');}
+      catch(e) {error(e.message);load.disabled=false;}
+    });
+    notice.append(load);section.append(notice);
+  }
+  if (!plan.counts.get(root)) return section;
+  const details=node('details',undefined,'thread-replies'); details.open=!collapsedThreads.has(root);
+  const summary=node('summary'); summary.append(node('span',`${plan.counts.get(root)}件の返信`));
+  const badge=node('span',undefined,'unread-badge');summary.append(badge);
+  const group=node('div',undefined,'reply-group');
+  const ids=[];
+  const stack=plan.children.get(root).slice().reverse().map(id=>({id,target:group,depth:1}));
+  while (stack.length) {
+    const {id,target,depth}=stack.pop();ids.push(id);
+    const wrapper=node('div',undefined,'thread-reply');appendPost(wrapper,id,plan);target.append(wrapper);
+    const children=plan.children.get(id);
+    if (children.length) {
+      // Limit visual/DOM nesting on narrow screens and adversarially long chains.
+      const nested=depth<3?node('div',undefined,'reply-children'):target;
+      if (depth<3) wrapper.append(nested);
+      for (const child of children.slice().reverse()) stack.push({id:child,target:nested,depth:depth+1});
+    }
+  }
+  const updateBadge=()=>{const count=ids.filter(id=>unreadReplies.has(id)).length;badge.textContent=`新着 ${count}`;badge.hidden=!count;};
+  updateBadge();
+  summary.addEventListener('click',()=>{
+    if (details.open) collapsedThreads.add(root);
+    else {collapsedThreads.delete(root);for (const id of ids) unreadReplies.delete(id);updateBadge();}
+  });
+  details.append(summary,group);section.append(details);return section;
+}
 function render() {
   const query=$('search').value.trim().toLocaleLowerCase(); const author=$('author').value;
   const sorted=[...posts.values()].sort((a,b)=>b.id-a.id);
   const matches=sorted.filter(m=>(!author||m.sender===author)&&(!query||JSON.stringify(m).toLocaleLowerCase().includes(query)));
+  const plan=buildThreads(sorted,matches.map(m=>m.id));
   const expanded=[...document.querySelectorAll('.post .original[open]')].map(el=>el.closest('.post').id);
-  const fragment=document.createDocumentFragment(); for (const m of matches) fragment.append(card(m)); $('timeline').replaceChildren(fragment);
+  const fragment=document.createDocumentFragment();for (const root of plan.roots) fragment.append(threadView(root,plan));$('timeline').replaceChildren(fragment);
   for (const id of expanded) {const details=$(id)?.querySelector('.original');if (details) details.open=true;}
-  $('timeline').setAttribute('aria-busy','false'); $('count').textContent=`${posts.size}件を読み込み済み${query||author?` · ${matches.length}件を表示`:''}`;
+  $('timeline').setAttribute('aria-busy','false'); $('count').textContent=`${posts.size}件を読み込み済み${query||author?` · 一致 ${matches.length}件${plan.visible.size>matches.length?` ＋ 文脈 ${plan.visible.size-matches.length}件`:''}`:` · ${plan.roots.length}スレッド`}`;
   $('empty').hidden=matches.length!==0; $('empty').querySelector('h2').textContent=posts.size ? '一致する会話がありません' : 'まだ会話がありません';
   $('empty').querySelector('p').textContent=posts.size ? '検索条件や投稿者の絞り込みを変更してください。' : '新しい投稿が届くと、ここに表示されます。';
   const people=new Map(); for (const m of sorted) {if (!people.has(m.sender)) people.set(m.sender,{name:m.handle,count:0}); people.get(m.sender).count++;}
@@ -123,7 +180,7 @@ async function refresh(initial=false,force=false) {
   try {
     let added=0;
     if (initial) {const data=await api('history'); more=data.messages.length===100; added+=ingest(data.messages);}
-    else {for (let page=0;page<10;page++) {const data=await api(`history?after=${newest}`); added+=ingest(data.messages); if (data.messages.length<100) break;}}
+    else {for (let page=0;page<10;page++) {const data=await api(`history?after=${newest}`); added+=ingest(data.messages,true); if (data.messages.length<100) break;}}
     error(''); connection(true); $('updated').textContent=`最終取得 ${new Date().toLocaleTimeString('ja-JP',{hour:'2-digit',minute:'2-digit',second:'2-digit'})}`;
     if (initial||force||(added && window.scrollY<160)) render();
     else if (added) {pending+=added; $('new-messages').textContent=`↑ 新しい投稿 ${pending}件`; $('new-messages').hidden=false;}
