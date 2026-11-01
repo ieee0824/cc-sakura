@@ -100,7 +100,138 @@ pub struct Client {
     base: String,
     session: Option<String>,
 }
+pub struct Events {
+    response: reqwest::Response,
+    buffer: Vec<u8>,
+}
+impl Events {
+    async fn next(&mut self) -> Result<Option<Value>> {
+        loop {
+            let boundary = self
+                .buffer
+                .windows(2)
+                .position(|w| w == b"\n\n")
+                .map(|end| (end, 2))
+                .or_else(|| {
+                    self.buffer
+                        .windows(4)
+                        .position(|w| w == b"\r\n\r\n")
+                        .map(|end| (end, 4))
+                });
+            if let Some((end, separator)) = boundary {
+                let frame: Vec<u8> = self.buffer.drain(..end + separator).collect();
+                let text = std::str::from_utf8(&frame).context("invalid event UTF-8")?;
+                let data = text
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data:").map(str::trim_start))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !data.is_empty() {
+                    return Ok(Some(serde_json::from_str(&data)?));
+                }
+                continue;
+            }
+            match tokio::time::timeout(std::time::Duration::from_secs(45), self.response.chunk())
+                .await
+                .context("event heartbeat timed out")??
+            {
+                Some(chunk) => {
+                    self.buffer.extend_from_slice(&chunk);
+                    if self.buffer.len() > 256 * 1024 * 1024 {
+                        bail!("event exceeds 256 MiB");
+                    }
+                }
+                None => return Ok(None),
+            }
+        }
+    }
+}
+fn transient(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<reqwest::Error>().is_some_and(|e| {
+        if let Some(status) = e.status() {
+            return status.is_server_error();
+        }
+        e.is_connect() || e.is_request() || e.is_timeout() || e.is_body()
+    })
+}
 impl Client {
+    // A dedicated client has no whole-response timeout: SSE is intentionally long-lived.
+    async fn events(&self, args: &Value) -> Result<Option<Events>> {
+        let http = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()?;
+        let mut req = http
+            .get(format!("{}/api/events", self.base))
+            .query(args)
+            .header("Accept", "text/event-stream");
+        if let Some(token) = &self.session {
+            req = req.bearer_auth(token);
+        }
+        let response = tokio::time::timeout(std::time::Duration::from_secs(15), req.send())
+            .await
+            .context("event connection timed out")??;
+        if matches!(response.status().as_u16(), 404 | 405) {
+            return Ok(None);
+        }
+        let response = response.error_for_status()?;
+        if !response
+            .headers()
+            .get("content-type")
+            .is_some_and(|v| v.to_str().unwrap_or("").starts_with("text/event-stream"))
+        {
+            bail!("server did not return an event stream");
+        }
+        Ok(Some(Events {
+            response,
+            buffer: Vec::new(),
+        }))
+    }
+
+    async fn receive(&self, mut args: Value) -> Result<Value> {
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(
+                args["timeout_seconds"].as_u64().unwrap_or(300).min(300),
+            );
+        let mut legacy = false;
+        let mut delay = 1;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            args["timeout_seconds"] = json!(remaining.as_secs().max(1));
+            match self
+                .call(if legacy { "history" } else { "receive" }, args.clone())
+                .await
+            {
+                Ok(value) => {
+                    if !legacy
+                        || value["messages"]
+                            .as_array()
+                            .is_some_and(|ms| !ms.is_empty())
+                        || tokio::time::Instant::now() >= deadline
+                    {
+                        return Ok(value);
+                    }
+                    tokio::time::sleep_until(
+                        (tokio::time::Instant::now() + std::time::Duration::from_secs(1))
+                            .min(deadline),
+                    )
+                    .await;
+                }
+                Err(error) if !legacy && error.to_string() == "unknown operation" => legacy = true,
+                Err(error) => {
+                    if !transient(&error) || tokio::time::Instant::now() >= deadline {
+                        return Err(error);
+                    }
+                    eprintln!("receive reconnect: {error}");
+                    tokio::time::sleep_until(
+                        (tokio::time::Instant::now() + std::time::Duration::from_secs(delay))
+                            .min(deadline),
+                    )
+                    .await;
+                    delay = (delay * 2).min(10);
+                }
+            }
+        }
+    }
     async fn call(&self, operation: &str, args: Value) -> Result<Value> {
         let mut req = self
             .http
@@ -109,8 +240,14 @@ impl Client {
         if let Some(token) = &self.session {
             req = req.bearer_auth(token);
         }
+        if operation == "receive" {
+            req = req.timeout(std::time::Duration::from_secs(330));
+        }
         let response = req.send().await.context("connect to sakura server")?;
         let status = response.status();
+        if status.is_server_error() {
+            response.error_for_status_ref()?;
+        }
         let value: Value = response.json().await.context("invalid server response")?;
         if !status.is_success() {
             bail!("{}", value["error"].as_str().unwrap_or("request failed"));
@@ -213,8 +350,57 @@ async fn main() -> Result<()> {
             }
             let mut settings = Some(settings);
             let mut engine = None;
+            let mut stream: Option<Events> = None;
+            let mut legacy = false;
             loop {
-                let result = client.call("history", json!({"room":room,"after":after,"limit":limit,"mentions":mentions,"include_human":!raw})).await?;
+                let args = json!({"room":room,"after":after,"limit":limit,"include_human":!raw});
+                let mut args = args;
+                if let Some(id) = mentions {
+                    args["mentions"] = json!(id);
+                }
+                let result = if follow && !legacy {
+                    if stream.is_none() {
+                        match client.events(&args).await {
+                            Ok(Some(events)) => stream = Some(events),
+                            Ok(None) => {
+                                legacy = true;
+                                eprintln!("旧サーバーのためポーリングに切り替えます");
+                                continue;
+                            }
+                            Err(error) => {
+                                if !transient(&error)
+                                    && error.to_string() != "event connection timed out"
+                                {
+                                    return Err(error);
+                                }
+                                eprintln!("配信再接続待ち: {error}");
+                                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                                continue;
+                            }
+                        }
+                    }
+                    match stream.as_mut().unwrap().next().await {
+                        Ok(Some(value)) => value,
+                        result => {
+                            if let Err(error) = result {
+                                eprintln!("配信切断: {error}");
+                            }
+                            stream = None;
+                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                            continue;
+                        }
+                    }
+                } else {
+                    match client.call("history", json!({"room":room,"after":after,"limit":limit,"mentions":mentions,"include_human":!raw})).await {
+                        Ok(value) => value,
+                        Err(error) if follow && transient(&error) => {
+                            eprintln!("履歴再接続待ち: {error}");
+                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                };
                 let messages = result["messages"].as_array().context("missing messages")?;
                 let needs_translation = !raw
                     && messages
@@ -278,7 +464,7 @@ async fn main() -> Result<()> {
                 if !follow {
                     break;
                 }
-                if messages.len() < limit as usize {
+                if legacy && messages.len() < limit as usize {
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 }
             }

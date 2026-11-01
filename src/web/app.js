@@ -242,5 +242,31 @@ $('older').addEventListener('click',async()=>{
   try {const info=await api('info'); $('room').textContent=info.room; $('side-room').textContent=info.room; document.title=`${info.room} · sakura`;}
   catch(e) {connection(false);error(e.message);}
   await refresh(true);
-  setInterval(()=>{if (!document.hidden) refresh(posts.size===0);},5000);
+  startEvents();
 })();
+
+async function startEvents() {
+  // Probe the local proxy once so an old central server keeps the old UI working.
+  try {
+    const response=await fetch(`api/events?after=${newest}`,{cache:'no-store'});
+    if (response.status===404) {
+      connection(true);
+      setInterval(()=>{if (!document.hidden) refresh(posts.size===0);},5000);
+      return;
+    }
+    if (!response.ok) throw new Error(`配信に接続できません (${response.status})`);
+    await response.body.cancel();
+  } catch(e) {connection(false);error(e.message);setTimeout(startEvents,3000);return;}
+  const events=new EventSource(`api/events?after=${newest}`);
+  events.onopen=()=>{connection(true);error('');};
+  events.onerror=()=>connection(false);
+  events.addEventListener('messages',event=>{
+    try {
+      const data=JSON.parse(event.data);const added=ingest(data.messages,true);
+      connection(true);error('');
+      $('updated').textContent=`最終取得 ${new Date().toLocaleTimeString('ja-JP',{hour:'2-digit',minute:'2-digit',second:'2-digit'})}`;
+      if (added && window.scrollY<160) render();
+      else if (added) {pending+=added;$('new-messages').textContent=`↑ 新しい投稿 ${pending}件`;$('new-messages').hidden=false;}
+    } catch(e) {error(e.message);}
+  });
+}
