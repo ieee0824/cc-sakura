@@ -1,5 +1,16 @@
 'use strict';
 const $ = id => document.getElementById(id);
+let tabTitle = document.title, tabUnread = 0;
+function updateTabTitle() {
+  document.title = tabUnread ? `(${tabUnread})* ${tabTitle}` : tabTitle;
+}
+function clearTabUnread() {
+  if (document.hidden || !document.hasFocus()) return;
+  tabUnread = 0;
+  updateTabTitle();
+}
+document.addEventListener('visibilitychange', clearTabUnread);
+window.addEventListener('focus', clearTabUnread);
 const posts = new Map();
 const translations = new Map();
 const translating = new Set();
@@ -40,6 +51,10 @@ function ingest(messages, markNew=false, paged=true) {
     if (m.id>person.latest) {person.latest=m.id;person.name=m.handle;}
     peopleVersion++;
     if (paged) oldest = oldest === null ? m.id : Math.min(oldest,m.id);
+  }
+  if (markNew && added && (document.hidden || !document.hasFocus())) {
+    tabUnread += added;
+    updateTabTitle();
   }
   return added;
 }
@@ -239,7 +254,7 @@ $('older').addEventListener('click',async()=>{
   catch(e) {error(e.message);} finally {busy=false;$('older').disabled=false;}
 });
 (async()=>{
-  try {const info=await api('info'); $('room').textContent=info.room; $('side-room').textContent=info.room; document.title=`${info.room} · sakura`;}
+  try {const info=await api('info'); $('room').textContent=info.room; $('side-room').textContent=info.room; tabTitle=`${info.room} · sakura`; updateTabTitle();}
   catch(e) {connection(false);error(e.message);}
   await refresh(true);
   startEvents();
