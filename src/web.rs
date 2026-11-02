@@ -28,6 +28,7 @@ struct Viewer {
 pub async fn serve(
     client: Client,
     room: String,
+    bind: std::net::IpAddr,
     port: u16,
     settings: translate::Settings,
 ) -> Result<()> {
@@ -36,11 +37,14 @@ pub async fn serve(
             "HTML viewer needs a session for this room; join first, then configure session or pass --session"
         );
     }
+    if bind.is_unspecified() {
+        bail!("web --bind needs a specific interface IP (for example 127.0.0.1 or your LAN IP)");
+    }
     // Fail early on a wrong session or unreachable server, before advertising a viewer URL.
     client
         .call("history", json!({"room":room,"limit":1}))
         .await?;
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await?;
+    let listener = tokio::net::TcpListener::bind((bind, port)).await?;
     let origin = format!("http://{}", listener.local_addr()?);
     let capability = uuid::Uuid::new_v4();
     let prefix = format!("/{capability}");
@@ -79,7 +83,8 @@ pub async fn serve(
         .route("/api/history", get(history))
         .route("/api/events", get(events))
         .route("/api/message/{id}", get(message))
-        .route("/api/translate/{id}", post(interpret));
+        .route("/api/translate/{id}", post(interpret))
+        .route("/api/explain/{id}", post(explain));
     let app = Router::new()
         .route(
             &format!("{prefix}/"),
@@ -91,7 +96,7 @@ pub async fn serve(
     // Trailing slash makes relative asset/API URLs stay inside the capability path.
     println!("HTML viewer: {origin}{prefix}/");
     eprintln!(
-        "ブラウザで上のURLを開いてください。終了: Ctrl-C（URLを知るローカルの利用者は閲覧できます）"
+        "ブラウザで上のURLを開いてください。終了: Ctrl-C（接続可能でURLを知る利用者は閲覧できます）"
     );
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
@@ -131,7 +136,7 @@ async fn guard(
     let mut response = if wrong_host || wrong_origin || cross_site || missing_action_header {
         (
             StatusCode::FORBIDDEN,
-            "This viewer accepts same-origin localhost requests only",
+            "This viewer accepts requests from its configured origin only",
         )
             .into_response()
     } else {
@@ -250,6 +255,25 @@ async fn message(State(state): State<Arc<Viewer>>, Path(id): Path<i64>) -> ApiRe
     }
 }
 async fn interpret(State(state): State<Arc<Viewer>>, Path(id): Path<i64>) -> ApiResult {
+    interpret_message(state, id, false).await
+}
+async fn explain(State(state): State<Arc<Viewer>>, Path(id): Path<i64>) -> ApiResult {
+    interpret_message(state, id, true).await
+}
+fn reply_targets(message: &Value) -> Vec<i64> {
+    let reply = &message["payload"]["reply_to"];
+    let values = reply
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| vec![reply.clone()]);
+    values
+        .iter()
+        .filter_map(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()))
+        .filter(|id| *id > 0 && *id < message["id"].as_i64().unwrap_or(0))
+        .take(8)
+        .collect()
+}
+async fn interpret_message(state: Arc<Viewer>, id: i64, background: bool) -> ApiResult {
     if id < 1 {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -259,7 +283,7 @@ async fn interpret(State(state): State<Arc<Viewer>>, Path(id): Path<i64>) -> Api
     let permit = state.translating.clone().try_acquire_owned().map_err(|_| {
         (
             StatusCode::TOO_MANY_REQUESTS,
-            Json(json!({"error":"ほかの翻訳が実行中です。完了後に試してください。"})),
+            Json(json!({"error":"ほかの翻訳・背景説明が実行中です。完了後に試してください。"})),
         )
     })?;
     // rusqlite's local cache stays on a blocking thread. Model execution never blocks
@@ -276,7 +300,7 @@ async fn interpret(State(state): State<Arc<Viewer>>, Path(id): Path<i64>) -> Api
             .and_then(|m| m.first())
             .filter(|m| m["id"].as_i64() == Some(id))
             .context("message not found in this room")?;
-        if let Some(human) = message["human"].as_str().filter(|s| !s.is_empty()) {
+        if !background && let Some(human) = message["human"].as_str().filter(|s| !s.is_empty()) {
             return Ok(Json(json!({"status":"provided","text":human})));
         }
         let mut translation = state
@@ -298,18 +322,42 @@ async fn interpret(State(state): State<Arc<Viewer>>, Path(id): Path<i64>) -> Api
             "history",
             json!({"room":state.room,"after":id,"limit":20,"include_human":true}),
         ))?;
-        let answer = runtime.block_on(
-            engine.translate(
-                &state.client.base,
-                &state.room,
-                message,
-                previous["messages"].as_array().context("missing context")?,
-                following["messages"]
-                    .as_array()
-                    .context("missing context")?,
-                &result["codecs"],
-            ),
-        )?;
+        let mut context = previous["messages"].as_array().context("missing context")?.clone();
+        let following_messages = following["messages"].as_array().context("missing context")?;
+        if background {
+            // Resolve up to eight explicit reply ancestors, even outside the nearby page.
+            // Every lookup remains authenticated and constrained to this viewer's room.
+            let mut queue = std::collections::VecDeque::from(reply_targets(message));
+            let mut visited = std::collections::HashSet::new();
+            let mut ancestors = Vec::new();
+            while let Some(parent) = queue.pop_front() {
+                if visited.len() >= 8 { break; }
+                if !visited.insert(parent) { continue; }
+                let found = context.iter().find(|m| m["id"].as_i64() == Some(parent)).cloned();
+                let found = match found {
+                    Some(value) => Some(value),
+                    None => {
+                        let page = runtime.block_on(state.client.call("history", json!({"room":state.room,"after":parent-1,"limit":1,"include_human":true})))?;
+                        page["messages"].as_array().and_then(|ms| ms.first()).filter(|m| m["id"].as_i64() == Some(parent)).cloned()
+                    }
+                };
+                if let Some(found) = found {
+                    queue.extend(reply_targets(&found));
+                    ancestors.push(found);
+                }
+            }
+            let ids: std::collections::HashSet<_> = ancestors.iter().filter_map(|m| m["id"].as_i64()).collect();
+            context.retain(|m| !ids.contains(&m["id"].as_i64().unwrap_or(0)));
+            let nearby = 20usize.saturating_sub(ancestors.len());
+            context = context.into_iter().rev().take(nearby).collect();
+            context.extend(ancestors);
+            context.sort_by_key(|m| m["id"].as_i64().unwrap_or(0));
+        }
+        let answer = if background {
+            runtime.block_on(engine.explain(&state.client.base, &state.room, message, &context, following_messages, &result["codecs"]))?
+        } else {
+            runtime.block_on(engine.translate(&state.client.base, &state.room, message, &context, following_messages, &result["codecs"]))?
+        };
         Ok::<_, anyhow::Error>(Json(serde_json::to_value(answer)?))
     })
     .await
