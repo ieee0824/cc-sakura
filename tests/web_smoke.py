@@ -33,10 +33,17 @@ with tempfile.TemporaryDirectory() as directory:
     fake = root / 'translator.py'
     fake.write_text('#!' + sys.executable + '\n' + r'''import json, pathlib, sys, time
 root = pathlib.Path(__file__)
-data = json.loads(sys.stdin.read().split('\n',1)[1])
-assert data['message']['payload'] == [7,1]
+prompt = sys.stdin.read()
+data = json.loads(prompt.split('\n',1)[1])
+background = 'This is background explanation, not translation.' in prompt
+if background and isinstance(data['message']['payload'],dict):
+    assert data['message']['payload']['reply_to'] == 1
+    assert any(m['id']==1 for m in data['preceding_messages']), 'distant ancestor missing'
+else:
+    assert data['message']['payload'] == [7,1]
+assert 'sender_ip' not in prompt and 'session' not in data['message']
 assert data['preceding_messages'] and data['following_messages']
-with root.with_suffix('.calls').open('a') as out: out.write('call\n')
+with root.with_suffix('.calls').open('a') as out: out.write(('background' if background else 'call')+'\n')
 time.sleep(.7)
 print(json.dumps({'status':'uncertain','text':'テスト成功と推測します。<script>window.injected=1</script>'}))
 ''')
@@ -134,10 +141,27 @@ print(json.dumps({'status':'uncertain','text':'テスト成功と推測します
             else: raise AssertionError('translator was not called')
             assert request(url + 'api/history')[0] == 200
             assert request(url + f'api/translate/{target}', b'', action_headers)[0] == 429
+            assert request(url + f'api/explain/{target}', b'', action_headers)[0] == 429
             status, _, translated = future.result(timeout=10)
             assert status == 200 and json.loads(translated)['status'] == 'uncertain', translated
         assert request(url + f'api/translate/{target}', b'', action_headers)[0] == 200
         assert fake.with_suffix('.calls').read_text().splitlines() == ['call'], 'cache not reused'
+        # Background is explicit, distinct from translation, and has a separate prompt/cache.
+        assert request(url + f'api/explain/{target}', b'')[0] == 403
+        assert request(url + 'api/explain/0', b'', action_headers)[0] == 400
+        status, _, explained = request(url + f'api/explain/{target}', b'', action_headers)
+        assert status == 200 and json.loads(explained)['status'] == 'uncertain', explained
+        assert fake.with_suffix('.calls').read_text().splitlines() == ['call','background']
+        assert request(url + f'api/explain/{target}', b'', action_headers)[0] == 200
+        assert fake.with_suffix('.calls').read_text().splitlines() == ['call','background']
+        # Provided human text must not bypass background AI; resolve an ancestor outside the 20-message page.
+        background_target = api('send', {'room':'test-room','payload':{'reply_to':1,'text':'status changed'},'gloss':'provided explanation'}, session)['id']
+        api('send', {'room':'test-room','payload':'after background'}, session)
+        assert request(url + f'api/explain/{background_target}', b'', action_headers)[0] == 200
+        assert fake.with_suffix('.calls').read_text().splitlines() == ['call','background','background']
+        assert request(url + f'api/translate/{background_target}', b'', action_headers)[0] == 200
+        assert fake.with_suffix('.calls').read_text().splitlines() == ['call','background','background']
+        assert request(url + f'api/explain/{other_id}', b'', action_headers)[0] == 502
         # API is read-only: no proxy to join/send or arbitrary rooms.
         assert request(url + 'api/send', b'{}', action_headers)[0] == 404
         assert request(url + 'api/history?room=another-room')[0] == 200  # always uses configured room

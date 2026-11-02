@@ -15,6 +15,9 @@ const posts = new Map();
 const translations = new Map();
 const translating = new Set();
 const translationErrors = new Map();
+const explanations = new Map();
+const explaining = new Set();
+const explanationErrors = new Map();
 const collapsedThreads = new Set();
 const unreadReplies = new Set();
 const {replyIds,build:buildThreads,replies:threadReplies} = SakuraThreads;
@@ -87,6 +90,20 @@ function syncTranslation(article,m) {
   if (translations.has(m.id)) showInterpretation(box,translations.get(m.id));
   else if (translationErrors.has(m.id)) {box.textContent=translationErrors.get(m.id);box.hidden=false;box.classList.add('error');}
 }
+function syncExplanation(article,m) {
+  const button=article.querySelector('.explain-button');
+  const box=article.querySelector('.background-explanation');
+  button.disabled=explaining.has(m.id);
+  button.textContent=button.disabled?'✧ 背景を確認しています…':'✧ 背景を説明';
+  if (explanations.has(m.id)) {
+    const result=explanations.get(m.id);
+    const title={translated:'背景説明',uncertain:'背景説明・推測を含む',uninterpretable:'背景の情報が不足しています'};
+    box.textContent=`${title[result.status] || '背景説明'}\n${result.text}`;
+    box.hidden=false;box.classList.remove('error');
+  } else if (explanationErrors.has(m.id)) {
+    box.textContent=explanationErrors.get(m.id);box.hidden=false;box.classList.add('error');
+  }
+}
 function referenceTag(kind,value) {
   const number=String(value).match(/(?:^|\/)(\d+)\/?$/)?.[1];
   const tag=node('span',number?`${kind} #${number}`:`${kind} ${value}`,'tag');
@@ -131,6 +148,14 @@ function card(m) {
     try {const result=await api(`translate/${m.id}`,{method:'POST'}); translations.set(m.id,result);}
     catch(e) {translationErrors.set(m.id,e.message);}
     finally {translating.delete(m.id); const current=$(`post-${m.id}`); if (current) syncTranslation(current,m);}
+  });
+  const explainButton=fragment.querySelector('.explain-button');
+  syncExplanation(article,m);
+  explainButton.addEventListener('click',async()=>{
+    explaining.add(m.id);explanations.delete(m.id);explanationErrors.delete(m.id);syncExplanation(article,m);
+    try {const result=await api(`explain/${m.id}`,{method:'POST'});explanations.set(m.id,result);}
+    catch(e) {explanationErrors.set(m.id,e.message);}
+    finally {explaining.delete(m.id);const current=$(`post-${m.id}`);if (current) syncExplanation(current,m);}
   });
   cardCache.set(m.id,article);
   return article;
