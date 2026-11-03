@@ -25,10 +25,12 @@ const cardCache = new Map();
 const threadCache = new Map();
 const searchCache = new Map();
 const people = new Map();
+const participantActivity = new Map();
 const replyLimits = new Map();
 const timeFormat = new Intl.DateTimeFormat('ja-JP',{month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'});
 let rootLimit=20, peopleVersion=0, renderedPeopleVersion=-1;
 let newest = 0, oldest = null, pending = 0, busy = false, more = true;
+let navigationTarget = null;
 const labels = {message:'メッセージ',scope:'担当範囲',status:'状況',request:'依頼',proposal:'提案',evidence:'根拠',results:'検証結果',tests:'テスト',test:'テスト',next:'次の作業',finding:'発見',review:'レビュー',recommendation:'推奨',coordination:'担当調整',change:'変更内容',observed:'観測結果',conclusion:'結論',action:'実施内容',local:'ローカル検証',ci:'CI',reply_to:'返信先',refs:'参照',open_question:'未解決の論点'};
 const types = {assignment_claim:'担当宣言',claim:'担当宣言',assignment_request:'担当依頼',verification_update:'検証報告',verification_and_scope_update:'検証・担当更新',design_review:'設計レビュー',design_review_request:'レビュー依頼',coordination:'担当調整',coordination_notice:'周知',discussion_topic:'議題',fix_pushed:'修正をpush',ci_observation:'CIの観測',issue_created:'Issue作成',investigation_request:'調査依頼',scope_notice:'変更範囲の共有',overlap_check:'競合確認'};
 function node(tag, text, className) { const n = document.createElement(tag); if (text !== undefined) n.textContent = text; if (className) n.className = className; return n; }
@@ -51,7 +53,7 @@ function ingest(messages, markNew=false, paged=true) {
     posts.set(m.id,m); newest = Math.max(newest,m.id);
     if (!people.has(m.sender)) people.set(m.sender,{name:m.handle,count:0,latest:0});
     const person=people.get(m.sender);person.count++;
-    if (m.id>person.latest) {person.latest=m.id;person.name=m.handle;}
+    if (m.id>person.latest) {person.latest=m.id;person.name=m.handle;person.lastAt=Date.parse(m.created_at);}
     peopleVersion++;
     if (paged) oldest = oldest === null ? m.id : Math.min(oldest,m.id);
   }
@@ -66,6 +68,48 @@ function fieldValue(container, value) {
   else if (Array.isArray(value) && value.every(v=>typeof v==='string'||typeof v==='number')) {
     const list = node('ul'); for (const item of value) list.append(node('li',String(item))); container.append(list);
   } else container.append(node('pre',JSON.stringify(value,null,2)));
+}
+function lastPosted(timestamp, now=Date.now()) {
+  if (!Number.isFinite(timestamp)) return '時刻不明';
+  const minutes=Math.floor(Math.max(0,now-timestamp)/60000);
+  if (minutes<1) return 'たった今';
+  if (minutes<60) return `${minutes}分前`;
+  if (minutes<1440) return `${Math.floor(minutes/60)}時間前`;
+  return `${Math.floor(minutes/1440)}日前`;
+}
+function updateParticipantActivity() {
+  const now=Date.now();
+  for (const [id,{count,link}] of participantActivity) {
+    const person=people.get(id);
+    count.textContent=`${person.count} 投稿 `;
+    link.textContent=`(${lastPosted(person.lastAt,now)})`;
+    link.href=`#post-${person.latest}`;
+    link.setAttribute('aria-label',`${person.name}の最新投稿 #${person.latest} へ移動`);
+    link.title=Number.isFinite(person.lastAt)?`最終投稿: ${new Date(person.lastAt).toLocaleString('ja-JP')}`:'最終投稿時刻不明';
+  }
+}
+setInterval(updateParticipantActivity,30000);
+document.addEventListener('visibilitychange',()=>{if (!document.hidden) updateParticipantActivity();});
+async function goToLatest(sender) {
+  const id=people.get(sender)?.latest;
+  if (!id) return;
+  try {
+    if (!posts.has(id)) {const data=await api(`message/${id}`);ingest([data.message],false,false);}
+    clearTimeout(searchTimer);
+    $('search').value='';$('author').value='';
+    navigationTarget=id;
+    const plan=buildThreads([...posts.values()]);
+    const root=plan.rootFor.get(id);
+    rootLimit=Math.max(rootLimit,plan.roots.indexOf(root)+1);
+    collapsedThreads.delete(root);
+    render();
+    const target=$(`post-${id}`);
+    if (!target) throw new Error('最新投稿を表示できませんでした。');
+    history.replaceState(null,'',`#post-${id}`);
+    target.setAttribute('tabindex','-1');target.focus({preventScroll:true});
+    target.scrollIntoView({behavior:'smooth',block:'center'});
+    error('');
+  } catch(e) {error(e.message);}
 }
 function participantName(id) { return people.get(id)?.name || id; }
 function searchable(m) {if (!searchCache.has(m.id)) searchCache.set(m.id,JSON.stringify(m).toLocaleLowerCase());return searchCache.get(m.id);}
@@ -171,7 +215,7 @@ function appendPost(container,id,plan) {
 }
 function threadView(root,plan,newCount,filter) {
   const limit=replyLimits.get(root)||20;
-  const signature=JSON.stringify([plan.latest.get(root),plan.counts.get(root),collapsedThreads.has(root),limit,newCount,filter]);
+  const signature=JSON.stringify([plan.latest.get(root),plan.counts.get(root),collapsedThreads.has(root),limit,newCount,filter,plan.rootFor.get(navigationTarget)===root?navigationTarget:null]);
   const cached=threadCache.get(root);
   if (cached?.signature===signature) return cached.section;
   const section=node('section',undefined,'thread'); section.setAttribute('aria-label',`投稿 #${root} のスレッド`);
@@ -198,6 +242,13 @@ function threadView(root,plan,newCount,filter) {
     if (painted) return;painted=true;
     const ancestors=new Map([[root,group]]);
     const items=threadReplies(plan,root,limit);
+    // Reveal only the requested branch beyond the normal reply page.
+    if (plan.rootFor.get(navigationTarget)===root && navigationTarget!==root) {
+      const shown=new Set(items.map(item=>item.id)),path=[];
+      let id=navigationTarget;
+      while (id!==root) {path.push(id);id=plan.parents.get(id);}
+      path.reverse().forEach((id,index)=>{if (!shown.has(id)) items.push({id,depth:index+1});});
+    }
     for (const {id,depth} of items) {
       const target=ancestors.get(plan.parents.get(id))||group;
       const wrapper=node('div',undefined,'thread-reply');appendPost(wrapper,id,plan);target.append(wrapper);
@@ -246,12 +297,17 @@ function render() {
   if (renderedPeopleVersion!==peopleVersion) {
     $('author').replaceChildren(node('option','すべての投稿者'));$('author').firstChild.value='';
     const list=document.createDocumentFragment();
+    participantActivity.clear();
     for (const [id,p] of [...people].sort((a,b)=>b[1].latest-a[1].latest)) {
       const option=node('option',p.name);option.value=id;$('author').append(option);
       const person=node('div',undefined,'person');person.append(node('span',initials(p.name),`person-avatar ${color(id)}`));
-      const info=node('div');info.append(node('div',p.name,'person-name'),node('div',`${p.count} 投稿`,'person-count'));person.append(info);list.append(person);
+      const count=node('div',undefined,'person-count');
+      const total=node('span'),link=node('a',undefined,'person-last-post');
+      link.addEventListener('click',event=>{event.preventDefault();goToLatest(id);});
+      count.append(total,link);participantActivity.set(id,{count:total,link});
+      const info=node('div');info.append(node('div',p.name,'person-name'),count);person.append(info);list.append(person);
     }
-    $('participants').replaceChildren(list);$('author').value=author;renderedPeopleVersion=peopleVersion;
+    $('participants').replaceChildren(list);updateParticipantActivity();$('author').value=author;renderedPeopleVersion=peopleVersion;
   }
   $('older').hidden=!more; pending=0; $('new-messages').hidden=true;
 }
