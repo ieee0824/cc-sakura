@@ -165,6 +165,37 @@ print(json.dumps({'status':'uncertain','text':'テスト成功と推測します
         # API is read-only: no proxy to join/send or arbitrary rooms.
         assert request(url + 'api/send', b'{}', action_headers)[0] == 404
         assert request(url + 'api/history?room=another-room')[0] == 200  # always uses configured room
+        approval = api('send', {'room':'test-room','payload':{'type':'approval_request','title':'限定テストを実行','description':'1回だけ実行する','options':['承認','保留']}}, session)['id']
+        assert json.loads(request(url+'api/approvals')[2])['requests'][0]['request']['id'] == approval
+        choice_headers = {**action_headers, 'Content-Type':'application/json'}
+        assert request(url+f'api/approvals/{approval}', json.dumps({'choice':'承認'}).encode(), choice_headers)[0] == 403
+        viewer.terminate(); viewer.wait(timeout=5)
+        viewer = subprocess.Popen(common + ['--session',session,'web','test-room','--port','0','--allow-approvals'], stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+        with selectors.DefaultSelector() as selector:
+            selector.register(viewer.stdout,selectors.EVENT_READ)
+            assert selector.select(timeout=10)
+        url=viewer.stdout.readline().strip().removeprefix('HTML viewer: ')
+        action_headers={'X-Sakura-Viewer':'1','Content-Type':'application/json'}
+        assert request(url+f'api/approvals/{approval}', b'{"choice":"invalid"}',action_headers)[0] == 400
+        assert request(url+f'api/approvals/{other_id}', json.dumps({'choice':'承認'}).encode(),action_headers)[0] == 404
+        assert request(url+f'api/approvals/{approval}', json.dumps({'choice':'承認'}).encode())[0] == 403
+        def approve():
+            return json.loads(request(url+f'api/approvals/{approval}',json.dumps({'choice':'承認'}).encode(),action_headers)[2])
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            results=list(pool.map(lambda _:approve(),range(2)))
+        assert sorted(r['status'] for r in results)==['already_decided','sent'],results
+        queue=json.loads(request(url+'api/approvals')[2])
+        decision=queue['requests'][0]['decision']
+        assert decision['payload']['reply_to']==approval and decision['payload']['choice']=='承認'
+        assert decision['sender']==joined['id'] and decision['mentions']==[joined['id']]
+        # A new viewer reconstructs the same resolved queue from central history.
+        viewer.terminate();viewer.wait(timeout=5)
+        viewer = subprocess.Popen(common + ['--session',session,'web','test-room','--port','0','--allow-approvals'],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+        with selectors.DefaultSelector() as selector:
+            selector.register(viewer.stdout,selectors.EVENT_READ)
+            assert selector.select(timeout=10)
+        url=viewer.stdout.readline().strip().removeprefix('HTML viewer: ')
+        assert json.loads(request(url+'api/approvals')[2])['requests'][0]['decision']['id']==decision['id']
         print('HTML assets, latest/older/new posts, local origin protection, explicit translation, cache and responsive polling: OK')
         if '--preview' in sys.argv:
             print(url, flush=True)

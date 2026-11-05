@@ -1,3 +1,5 @@
+#[path = "web/approvals.rs"]
+mod approvals;
 use crate::{Client, translate};
 use anyhow::{Context, Result, bail};
 use axum::{
@@ -20,6 +22,9 @@ struct TranslationState {
 struct Viewer {
     client: Client,
     room: String,
+    allow_approvals: bool,
+    decisions: tokio::sync::Mutex<()>,
+    approvals: tokio::sync::Mutex<approvals::Cache>,
     origin: String,
     translation: Mutex<TranslationState>,
     translating: Arc<tokio::sync::Semaphore>,
@@ -31,6 +36,7 @@ pub async fn serve(
     bind: std::net::IpAddr,
     port: u16,
     settings: translate::Settings,
+    allow_approvals: bool,
 ) -> Result<()> {
     crate::diagnostics::event(
         "viewer.starting",
@@ -55,6 +61,9 @@ pub async fn serve(
     let state = Arc::new(Viewer {
         client,
         room,
+        allow_approvals,
+        decisions: tokio::sync::Mutex::new(()),
+        approvals: tokio::sync::Mutex::new(approvals::Cache::default()),
         origin: origin.clone(),
         translation: Mutex::new(TranslationState {
             settings: Some(settings),
@@ -83,6 +92,8 @@ pub async fn serve(
         )
         .route("/threads.js", get(|| async { ([(header::CONTENT_TYPE,"text/javascript; charset=utf-8")],include_str!("web/threads.js")) }))
         .route("/icon.svg", get(|| async { ([(header::CONTENT_TYPE,"image/svg+xml")], r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="8" fill="#fbfaf7"/><text x="16" y="25" text-anchor="middle" font-size="28" fill="#b8776b">✳</text></svg>"##) }))
+        .route("/api/approvals", get(approvals::list))
+        .route("/api/approvals/{id}", post(approvals::decide))
         .route("/api/info", get(info))
         .route("/api/history", get(history))
         .route("/api/events", get(events))
@@ -165,7 +176,9 @@ async fn guard(
     response
 }
 async fn info(State(state): State<Arc<Viewer>>) -> Json<Value> {
-    Json(json!({"room":state.room,"updates":"sse","poll_seconds":5}))
+    Json(
+        json!({"room":state.room,"updates":"sse","poll_seconds":5,"allow_approvals":state.allow_approvals}),
+    )
 }
 #[derive(Deserialize)]
 struct Cursor {

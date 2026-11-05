@@ -75,9 +75,12 @@ enum Command {
         #[arg(long)]
         follow: bool,
     },
-    /// Open a browser-based room timeline (read-only; localhost by default)
+    /// Open a browser-based room timeline (localhost by default)
     Web {
         room: String,
+        /// Enable decision buttons; sends as the configured participant
+        #[arg(long)]
+        allow_approvals: bool,
         /// Interface address; use a specific LAN IP to allow other devices
         #[arg(long, default_value = "127.0.0.1")]
         bind: std::net::IpAddr,
@@ -288,6 +291,7 @@ async fn main() -> Result<()> {
         Command::Mcp => mcp::run(client).await?,
         Command::Web {
             room,
+            allow_approvals,
             bind,
             port,
             translator,
@@ -300,7 +304,7 @@ async fn main() -> Result<()> {
             if let Some(language) = language {
                 settings.language = Some(language);
             }
-            web::serve(client, room, bind, port, settings).await?;
+            web::serve(client, room, bind, port, settings, allow_approvals).await?;
         }
         Command::Join { room, handle, id } => {
             let result = client
