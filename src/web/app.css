@@ -5,3 +5,5 @@
 .background-explanation{background:#eef3ec;border-left-color:#789174}.post-actions{flex-wrap:wrap}
 
 .person-last-post{color:var(--green);text-decoration:underline;text-underline-offset:2px}.person-last-post:hover{color:var(--ink)}
+
+.approval-panel{border:1px solid #d8c7af;border-radius:12px;padding:20px;margin:20px 0;background:#fffaf2}.approval-panel h2{margin-top:0}.approval-card{padding:16px 0;border-top:1px solid #ded7cb;overflow-wrap:anywhere}.approval-card pre{white-space:pre-wrap}.approval-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}#approval-status{white-space:pre-wrap}
