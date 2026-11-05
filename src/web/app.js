@@ -61,6 +61,7 @@ function ingest(messages, markNew=false, paged=true) {
     tabUnread += added;
     updateTabTitle();
   }
+  if (added) scheduleApprovals();
   return added;
 }
 function fieldValue(container, value) {
@@ -366,3 +367,48 @@ async function startEvents() {
     } catch(e) {error(e.message);}
   });
 }
+
+// The queue is reconstructed from the complete room history, independently of timeline pagination.
+let approvalTimer, approvalLoading=false, approvalAgain=false;
+function scheduleApprovals() {
+  clearTimeout(approvalTimer);
+  approvalTimer=setTimeout(loadApprovals,500);
+}
+async function loadApprovals() {
+  if (approvalLoading) {approvalAgain=true;return;}
+  approvalLoading=true;
+  try {
+    const data=await api('approvals');
+    const pending=data.requests.filter(item=>!item.decision);
+    $('approval-count').textContent=String(pending.length);
+    $('approval-mode').textContent=data.enabled?'選んだ内容を、このUIに設定された参加者の名義でroomに投稿します。':'閲覧のみ。承認ボタンは起動時の --allow-approvals で有効になります。';
+    const list=document.createDocumentFragment();
+    for (const {request:m} of pending) {
+      const box=node('article',undefined,'approval-card');
+      box.append(node('strong',m.payload.title),node('p',`${m.handle} · #${m.id}`));
+      if (m.payload.description) box.append(node('p',String(m.payload.description)));
+      const raw=node('details');raw.append(node('summary','依頼の原文'),node('pre',JSON.stringify(m.payload,null,2)));box.append(raw);
+      const actions=node('div',undefined,'approval-actions');
+      for (const choice of m.payload.options) {
+        const button=node('button',choice,'quiet-button');button.type='button';button.disabled=!data.enabled;
+        button.addEventListener('click',async()=>{
+          if (!window.confirm(`「${m.payload.title}」
+選択: ${choice}
+この判断をroomへ投稿しますか？`)) return;
+          for (const b of actions.querySelectorAll('button')) b.disabled=true;
+          try {
+            const result=await api(`approvals/${m.id}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({choice})});
+            $('approval-status').textContent=result.status==='already_decided'?'この依頼は回答済みです。':`判断を投稿しました (#${result.id})。`;
+            await loadApprovalsAfterDecision();refresh(false,true);
+          } catch(e) {$('approval-status').textContent=`投稿を確認できませんでした: ${e.message}。再読み込みして回答済みか確認してください。`;scheduleApprovals();}
+        });actions.append(button);
+      }
+      box.append(actions);list.append(box);
+    }
+    if (!pending.length) list.append(node('p','承認待ちはありません。'));
+    $('approval-list').replaceChildren(list);
+  } catch(e) {$('approval-status').textContent=`承認待ちの取得に失敗しました: ${e.message}`;}
+  finally {approvalLoading=false;if (approvalAgain) {approvalAgain=false;scheduleApprovals();}}
+}
+async function loadApprovalsAfterDecision() { await loadApprovals(); }
+scheduleApprovals();
