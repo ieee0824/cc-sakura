@@ -38,6 +38,10 @@ pub async fn serve(
     settings: translate::Settings,
     allow_approvals: bool,
 ) -> Result<()> {
+    crate::diagnostics::event(
+        "viewer.starting",
+        json!({"bind":bind.to_string(),"port":port}),
+    );
     if client.session.is_none() {
         bail!(
             "HTML viewer needs a session for this room; join first, then configure session or pass --session"
@@ -106,6 +110,10 @@ pub async fn serve(
         .with_state(state);
     // Trailing slash makes relative asset/API URLs stay inside the capability path.
     println!("HTML viewer: {origin}{prefix}/");
+    crate::diagnostics::event(
+        "viewer.listening",
+        json!({"address":listener.local_addr()?.to_string()}),
+    );
     eprintln!(
         "ブラウザで上のURLを開いてください。終了: Ctrl-C（接続可能でURLを知る利用者は閲覧できます）"
     );

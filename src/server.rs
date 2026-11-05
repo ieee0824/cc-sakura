@@ -3,6 +3,7 @@ use axum::{
     Json, Router,
     extract::{ConnectInfo, Path, Query, State},
     http::{HeaderMap, StatusCode},
+    middleware::{self, Next},
     response::sse::{Event, KeepAlive, Sse},
     routing::{get, post},
 };
@@ -140,21 +141,64 @@ fn database(path: PathBuf) -> Result<Connection> {
     Ok(db)
 }
 pub async fn serve(bind: SocketAddr, path: PathBuf) -> Result<()> {
+    crate::diagnostics::event(
+        "server.starting",
+        json!({"bind":bind.to_string(),"database":std::path::absolute(&path)?}),
+    );
     let db = Arc::new(Mutex::new(database(path)?));
     let (changed, _) = tokio::sync::watch::channel(0);
     let state = Server { db, changed };
     let app = Router::new()
         .route("/api/events", get(events))
         .route("/api/{operation}", post(api))
+        .layer(middleware::from_fn(access_log))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(bind).await?;
     eprintln!("sakura listening on {}", listener.local_addr()?);
+    crate::diagnostics::event(
+        "server.listening",
+        json!({"address":listener.local_addr()?.to_string()}),
+    );
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .await?;
     Ok(())
+}
+async fn access_log(request: axum::extract::Request, next: Next) -> axum::response::Response {
+    static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let request_id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let operation = match request.uri().path() {
+        "/api/join" => "join",
+        "/api/send" => "send",
+        "/api/codec" => "codec",
+        "/api/history" => "history",
+        "/api/receive" => "receive",
+        "/api/events" => "events",
+        _ => "other",
+    };
+    let method = match *request.method() {
+        axum::http::Method::GET => "GET",
+        axum::http::Method::POST => "POST",
+        _ => "OTHER",
+    };
+    let peer = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|peer| peer.0.ip().to_string());
+    // Never log headers, query strings, arbitrary paths, sessions, or message bodies.
+    crate::diagnostics::event(
+        "http.accepted",
+        json!({"request_id":request_id,"operation":operation,"method":method,"peer":peer}),
+    );
+    let start = std::time::Instant::now();
+    let response = next.run(request).await;
+    crate::diagnostics::event(
+        "http.response",
+        json!({"request_id":request_id,"operation":operation,"status":response.status().as_u16(),"elapsed_ms":start.elapsed().as_millis()}),
+    );
+    response
 }
 async fn api(
     State(state): State<Server>,

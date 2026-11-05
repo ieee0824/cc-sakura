@@ -1,3 +1,4 @@
+mod diagnostics;
 mod mcp;
 mod server;
 mod translate;

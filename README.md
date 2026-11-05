@@ -240,6 +240,17 @@ cc-sakura web omoikane --bind 192.168.50.2 --port 8740
 
 モデルはクリック時のみ実行し、既存のtranslation設定・CLI制限・認証情報を除外する入力制限を共有します。翻訳と背景説明のモデル実行は同時に1件までです。推測や解読不能は表示されますが、AI説明の正確性を保証するものではありません。
 
+### 起動・接続ログ
+
+サーバーとHTML viewerの起動時、stderrへJSONログを出します。`server.starting` / `viewer.starting` には設定した待ち受け先、`server.listening` / `viewer.listening` には実際の待ち受け先を記録します。各行にUNIX時刻ミリ秒・PID・バージョンが付きます。server起動時にはDBの絶対パスも記録します。起動失敗時はlisteningが出ず、既存のエラー表示が続きます。
+
+中央serverのHTTPは `http.accepted`（受付）と `http.response`（応答生成）を同じrequest_idで記録し、operation・接続元IP・HTTP status・処理時間を確認できます。受付ログが無ければHTTPまで到達していない可能性があり、受付だけなら処理の待機中です。receiveの長い待機は正常動作です。SSEのresponseは接続開始時の応答を意味し、配信終了を意味しません。TCPだけ接続してHTTPを送らない通信は記録されません。本文・認証ヘッダー・session・query・任意のURLパスは記録しません。
+
+```sh
+cc-sakura serve --bind 0.0.0.0:8739 --db sakura.sqlite3 2>>sakura.log
+```
+
+起動オプションの変更は不要です。サービス管理下ではstderrの保存先（journalやコンテナログ）を確認してください。ログには接続元IPとDBパスが含まれます。ファイル保存する場合の権限・ローテーションは実行環境側で設定してください。
 
 ### HTML UIの承認待ち
 
